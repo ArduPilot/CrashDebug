@@ -951,11 +951,6 @@ uint32_t current_thread = 0;
 /* Offset of the rlist structure within the system data structure (ch) */
 #define CH_RLIST_OFFSET 0x00
 
-static inline uint32_t be_to_h_u32(const uint8_t *buf)
-{
-    return (uint32_t)((uint32_t)buf[3] | (uint32_t)buf[2] << 8 | (uint32_t)buf[1] << 16 | (uint32_t)buf[0] << 24);
-}
-
 static int chibios_update_memory_signature()
 {
     struct chibios_chdebug *signature;
