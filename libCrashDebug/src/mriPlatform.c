@@ -23,6 +23,9 @@
 #include <posix4win.h>
 #include <printfSpy.h>
 #include <semihost.h>
+#include "mriPlatformPriv.h"
+#include <MallocFailureInject.h>
+
 
 
 /* NOTE: This is the original version of the following XML which has had things stripped to reduce the amount of
@@ -158,9 +161,11 @@ static void displayMemFaultCauseToGdbConsole(void);
 static void displayBusFaultCauseToGdbConsole(void);
 static void displayUsageFaultCauseToGdbConsole(void);
 static void sendRegisterForTResponse(Buffer* pBuffer, uint8_t registerOffset, uint32_t registerValue);
-static void writeBytesToBufferAsHex(Buffer* pBuffer, void* pBytes, size_t byteCount);
-static int hasFPURegisters();
+int hasFPURegisters();
 static void readBytesFromBufferAsHex(Buffer* pBuffer, void* pBytes, size_t byteCount);
+
+/* Calculates the number of items in a static array at compile time. */
+#define ARRAY_SIZE(X) (sizeof(X)/sizeof(X[0]))
 
 
 __throws void mriPlatform_Init(RegisterContext* pContext, IMemory* pMem)
@@ -595,7 +600,7 @@ static void sendRegisterForTResponse(Buffer* pBuffer, uint8_t registerOffset, ui
     Buffer_WriteChar(pBuffer, ';');
 }
 
-static void writeBytesToBufferAsHex(Buffer* pBuffer, void* pBytes, size_t byteCount)
+void writeBytesToBufferAsHex(Buffer* pBuffer, void* pBytes, size_t byteCount)
 {
     uint8_t* pByte = (uint8_t*)pBytes;
     size_t   i;
@@ -611,7 +616,7 @@ void Platform_CopyContextToBuffer(Buffer* pBuffer)
         writeBytesToBufferAsHex(pBuffer, g_pContext->FPR, sizeof(g_pContext->FPR));
 }
 
-static int hasFPURegisters()
+int hasFPURegisters()
 {
     return g_pContext->flags & CRASH_CATCHER_FLAGS_FLOATING_POINT;
 }
@@ -715,4 +720,523 @@ void __mriPlatform_EnteringDebuggerHook(void)
 
 void __mriPlatform_LeavingDebuggerHook(void)
 {
+}
+
+struct symbols_t {
+    const char *name;
+    uint32_t value;
+};
+
+static struct symbols_t chibios_symbol_list[] = {
+    {"ch", 0},       /* System data structure */
+    {"ch_debug", 0}, /* Memory Signature containing offsets of fields in rlist */
+};
+#define CHIBIOS_VAL_CH 0
+#define CHIBIOS_VAL_CH_DEBUG 1
+
+static uint8_t curr_symbol = 0;
+int __mriPlatform_SetSymbolRequest(Buffer* pBuffer)
+{
+    if (curr_symbol >= 2) // based on number of vars in chibios_symbol_list
+        return FALSE;
+    uint8_t i;
+    for (i=0; i<strlen(chibios_symbol_list[curr_symbol].name); i++)
+        Buffer_WriteByteAsHex(pBuffer, chibios_symbol_list[curr_symbol].name[i]);
+    return TRUE;
+}
+
+void __mriPlatform_SetSymbolAddress(Buffer* pBuffer, uint32_t address)
+{
+    if (curr_symbol >= 2)
+        return;
+    char symbolname[20] = {0};
+    uint8_t i = 0;
+    while (!Buffer_IsNextCharEqualTo(pBuffer, ':') && i < sizeof(symbolname)) {
+        symbolname[i++] = Buffer_ReadByteAsHex(pBuffer);
+    }
+    symbolname[i++] = '\0';
+    if (strcmp(symbolname, chibios_symbol_list[curr_symbol].name) == 0) {
+        chibios_symbol_list[curr_symbol].value = address;
+        curr_symbol++;
+    }
+}
+
+/***************************************************************************
+ *   Copyright (C) 2012 by Matthias Blaicher                               *
+ *   Matthias Blaicher - matthias@blaicher.com                             *
+ *                                                                         *
+ *   Copyright (C) 2011 by Broadcom Corporation                            *
+ *   Evan Hunter - ehunter@broadcom.com                                    *
+ *                                                                         *
+ *   This program is free software; you can redistribute it and/or modify  *
+ *   it under the terms of the GNU General Public License as published by  *
+ *   the Free Software Foundation; either version 2 of the License, or     *
+ *   (at your option) any later version.                                   *
+ *                                                                         *
+ *   This program is distributed in the hope that it will be useful,       *
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of        *
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the         *
+ *   GNU General Public License for more details.                          *
+ *                                                                         *
+ *   You should have received a copy of the GNU General Public License     *
+ *   along with this program.  If not, see <http://www.gnu.org/licenses/>. *
+ ***************************************************************************/
+
+struct stack_register_offset {
+	unsigned short number;		/* register number */
+	signed short offset;		/* offset in bytes from stack head, or -1 to indicate
+					 * register is not stacked, or -2 to indicate this is the
+					 * stack pointer register */
+	unsigned short width_bits;
+};
+
+struct rtos_register_stacking {
+	unsigned char stack_registers_size;
+	signed char stack_growth_direction;
+	unsigned char num_output_registers;
+	const struct stack_register_offset *register_offsets;
+};
+
+void read_address_to_mem(void *dest, uint32_t source, uint32_t size);
+int rtos_generic_stack_read(Buffer* pBuffer, const struct rtos_register_stacking *stacking, int64_t stack_ptr);
+
+void read_address_to_mem(void *dest, uint32_t source, uint32_t size)
+{
+    uint32_t i;
+    for (i = 0; i < size; i++)
+        ((uint8_t *)dest)[i] = Platform_MemRead8((void*)(uint64_t)(source+i));
+}
+
+int rtos_generic_stack_read(Buffer* pBuffer, const struct rtos_register_stacking *stacking, int64_t stack_ptr)
+{
+	if (stack_ptr == 0 || g_pContext == NULL) {
+		WriteStringToGdbConsole("Error: null stack pointer in thread\n");
+		return FALSE;
+	}
+	/* Read the stack */
+	uint8_t *stack_data = throwingZeroedMalloc(stacking->stack_registers_size);
+	uint32_t address = stack_ptr;
+
+	if (stacking->stack_growth_direction == 1)
+		address -= stacking->stack_registers_size;
+    read_address_to_mem(stack_data, address, stacking->stack_registers_size);
+
+#if 0
+		LOG_OUTPUT("Stack Data :");
+		for (i = 0; i < stacking->stack_registers_size; i++)
+			LOG_OUTPUT("%02X", stack_data[i]);
+		LOG_OUTPUT("\r\n");
+#endif
+
+	uint32_t new_stack_ptr = stack_ptr - stacking->stack_growth_direction * stacking->stack_registers_size;
+    int i;
+	for (i = 0; i < stacking->num_output_registers; ++i) {
+		int offset = stacking->register_offsets[i].offset;
+		if (offset == -2) {
+            g_pContext->R[i] = new_stack_ptr;
+        } else if (offset != -1) {
+            memcpy(&g_pContext->R[i], stack_data + offset, stacking->register_offsets[i].width_bits / 8);
+        }
+	}
+    // writeBytesToBufferAsHex(pBuffer, regs, TOTAL_REG_COUNT * sizeof(uint32_t));
+	free(stack_data);
+/*	LOG_OUTPUT("Output register string: %s\r\n", *hex_reg_list); */
+	return TRUE;
+}
+
+static const struct stack_register_offset rtos_chibios_arm_v7m_stack_offsets[TOTAL_REG_COUNT-2] = {
+	{ R0,   -1,   32 },		/* r0   */
+	{ R1,   -1,   32 },		/* r1   */
+	{ R2,   -1,   32 },		/* r2   */
+	{ R3,   -1,   32 },		/* r3   */
+	{ R4,   0x00, 32 },		/* r4   */
+	{ R5,   0x04, 32 },		/* r5   */
+	{ R6,   0x08, 32 },		/* r6   */
+	{ R7,   0x0c, 32 },		/* r7   */
+	{ R8,   0x10, 32 },		/* r8   */
+	{ R9,   0x14, 32 },		/* r9   */
+	{ R10,  0x18, 32 },		/* r10  */
+	{ R11,  0x1c, 32 },		/* r11  */
+	{ R12,  -1,   32 },		/* r12  */
+	{ SP,  -2,   32 },		/* sp   */
+	{ LR,  -1,   32 },		/* lr   */
+	{ PC,   0x20, 32 },		/* pc   */
+	{ XPSR, -1,   32 },		/* xPSR */
+};
+
+const struct rtos_register_stacking rtos_chibios_arm_v7m_stacking = {
+	0x24,					/* stack_registers_size */
+	-1,						/* stack_growth_direction */
+	TOTAL_REG_COUNT-2,	/* num_output_registers */
+	rtos_chibios_arm_v7m_stack_offsets	/* register_offsets */
+};
+
+static const struct stack_register_offset rtos_chibios_arm_v7m_stack_offsets_w_fpu[TOTAL_REG_COUNT-2] = {
+	{ R0,   -1,   32 },		/* r0   */
+	{ R1,   -1,   32 },		/* r1   */
+	{ R2,   -1,   32 },		/* r2   */
+	{ R3,   -1,   32 },		/* r3   */
+	{ R4,   0x40, 32 },		/* r4   */
+	{ R5,   0x44, 32 },		/* r5   */
+	{ R6,   0x48, 32 },		/* r6   */
+	{ R7,   0x4c, 32 },		/* r7   */
+	{ R8,   0x50, 32 },		/* r8   */
+	{ R9,   0x54, 32 },		/* r9   */
+	{ R10,  0x58, 32 },		/* r10  */
+	{ R11,  0x5c, 32 },		/* r11  */
+	{ R12,  -1,   32 },		/* r12  */
+	{ SP,  -2,   32 },		/* sp   */
+	{ LR,  -1,   32 },		/* lr   */
+	{ PC,   0x60, 32 },		/* pc   */
+	{ XPSR, -1,   32 },		/* xPSR */
+};
+
+const struct rtos_register_stacking rtos_chibios_arm_v7m_stacking_w_fpu = {
+	0x64,										/* stack_registers_size */
+	-1,											/* stack_growth_direction */
+	TOTAL_REG_COUNT-2,      						/* num_output_registers */
+	rtos_chibios_arm_v7m_stack_offsets_w_fpu	/* register_offsets */
+};
+
+// ChibiOS Specific Debugging
+struct chibios_chdebug {
+    char      ch_identifier[4];       
+    uint8_t   ch_zero;                
+    uint8_t   ch_size;                
+    uint16_t  ch_version;             
+    uint8_t   ch_ptrsize;             
+    uint8_t   ch_timesize;            
+    uint8_t   ch_threadsize;          
+    uint8_t   cf_off_prio;            
+    uint8_t   cf_off_ctx;             
+    uint8_t   cf_off_newer;           
+    uint8_t   cf_off_older;           
+    uint8_t   cf_off_name;            
+    uint8_t   cf_off_stklimit;        
+    uint8_t   cf_off_state;           
+    uint8_t   cf_off_flags;           
+    uint8_t   cf_off_refs;            
+    uint8_t   cf_off_preempt;         
+    uint8_t   cf_off_time;            
+};
+  
+#define GET_CH_KERNEL_MAJOR(coded_version) ((coded_version >> 11) & 0x1f)
+#define GET_CH_KERNEL_MINOR(coded_version) ((coded_version >> 6) & 0x1f)
+#define GET_CH_KERNEL_PATCH(coded_version) ((coded_version >> 0) & 0x3f)
+
+static const char * const chibios_thread_states[] = { "READY", "CURRENT",
+"WTSTART", "SUSPENDED", "QUEUED", "WTSEM", "WTMTX", "WTCOND", "SLEEPING",
+"WTEXIT", "WTOREVT", "WTANDEVT", "SNDMSGQ", "SNDMSG", "WTMSG", "FINAL"
+};
+
+#define CHIBIOS_NUM_STATES ARRAY_SIZE(chibios_thread_states)
+
+/* Maximum ChibiOS thread name. There is no real limit set by ChibiOS but 64
+* chars ought to be enough.
+*/
+#define CHIBIOS_THREAD_NAME_STR_SIZE (64)
+
+struct thread_detail {
+	int64_t threadid;
+	uint8_t exists;
+	char thread_name_str[CHIBIOS_THREAD_NAME_STR_SIZE];
+	char extra_info_str[100];
+};
+
+struct chibios_chdebug *chibios_signature = 0;
+const struct rtos_register_stacking *stacking_info = 0;
+struct thread_detail thread_details[50] = {0};
+uint16_t thread_count = 0;
+uint32_t current_thread = 0;
+/* Offset of the rlist structure within the system data structure (ch) */
+#define CH_RLIST_OFFSET 0x00
+
+static inline uint32_t be_to_h_u32(const uint8_t *buf)
+{
+    return (uint32_t)((uint32_t)buf[3] | (uint32_t)buf[2] << 8 | (uint32_t)buf[1] << 16 | (uint32_t)buf[0] << 24);
+}
+
+static int chibios_update_memory_signature()
+{
+    struct chibios_chdebug *signature;
+    if (chibios_signature != NULL) {
+        free(chibios_signature);
+    }
+    chibios_signature = NULL;
+    signature = throwingZeroedMalloc(sizeof(*signature));
+    if (!signature) {
+        WriteStringToGdbConsole("\nCould not allocate space for ChibiOS/RT memory signature\n");
+        return FALSE;
+    }
+
+    read_address_to_mem(signature, chibios_symbol_list[CHIBIOS_VAL_CH_DEBUG].value, sizeof(*signature));
+
+    if (strncmp(signature->ch_identifier, "main", 4) != 0) {
+        WriteStringToGdbConsole("Memory signature identifier does not contain magic bytes.\n");
+        goto errfree;
+    }
+
+    if (signature->ch_size < sizeof(*signature)) {
+        WriteStringToGdbConsole("ChibiOS/RT memory signature claims to be smaller "
+                "than expected\n");
+        goto errfree;
+    }
+
+    if (signature->ch_size > sizeof(*signature)) {
+        WriteStringToGdbConsole("ChibiOS/RT memory signature claims to be bigger than"
+                    " expected. Assuming compatibility...\n");
+    }
+
+    // WriteStringToGdbConsole("Successfully loaded memory map of ChibiOS/RT target \n");
+
+    /* Currently, we have the inherent assumption that all address pointers
+     * are 32 bit wide. */
+    if (signature->ch_ptrsize != sizeof(uint32_t)) {
+        WriteStringToGdbConsole("ChibiOS/RT target memory signature claims an address "
+                  "width unequal to 32 bits!\n");
+        free(signature);
+        return FALSE;
+    }
+
+    chibios_signature = signature;
+    return TRUE;
+
+errfree:
+    /* Error reading the ChibiOS memory structure */
+    free(signature);
+    chibios_signature = 0;
+    return FALSE;
+}
+
+#define FPU_CPACR	0xE000ED88
+static int chibios_update_stacking()
+{
+	/* Sometimes the stacking can not be determined only by looking at the
+	 * target name but only a runtime.
+	 *
+	 * For example, this is the case for Cortex-M4 targets and ChibiOS which
+	 * only stack the FPU registers if it is enabled during ChibiOS build.
+	 *
+	 * Terminating which stacking is used is target depending.
+	 *
+	 * Assumptions:
+	 *  - Once ChibiOS is actually initialized, the stacking is fixed.
+	 *  - During startup code, the FPU might not be initialized and the
+	 *    detection might fail.
+	 *  - Since no threads are running during startup, the problem is solved
+	 *    by delaying stacking detection until there are more threads
+	 *    available than the current execution. In which case
+	 *    chibios_get_thread_reg_list is called.
+	 */
+
+	if (!chibios_signature)
+		return FALSE;
+
+	/* Check for armv7m with *enabled* FPU, i.e. a Cortex-M4  */
+    if (hasFPURegisters()) {
+        /* Found ARM v7m target which includes a FPU */
+        uint32_t cpacr;
+
+        cpacr = Platform_MemRead32((void*)(uint64_t)(FPU_CPACR));
+
+        /* Check if CP10 and CP11 are set to full access.
+            * In ChibiOS this is done in ResetHandler() in crt0.c */
+        if (cpacr & 0x00F00000) {
+            WriteStringToGdbConsole("\nEnabled FPU detected.\n");
+            stacking_info = &rtos_chibios_arm_v7m_stacking_w_fpu;
+            return TRUE;
+        }
+    }
+
+    /* Found ARM v7m target with no or disabled FPU */
+    stacking_info = &rtos_chibios_arm_v7m_stacking;
+    return TRUE;
+}
+
+static int chibios_update_threads()
+{
+    int tasks_found = 0;
+    int symbols = TRUE;
+    uint8_t i;
+    for (i=0; i<ARRAY_SIZE(chibios_symbol_list); i++) {
+        if (chibios_symbol_list[i].value == 0) {
+            symbols=FALSE;
+        }
+    }
+    if (!symbols) {
+        WriteStringToGdbConsole("No symbols for ChibiOS\n");
+        return FALSE;
+    }
+    
+    /* Update the memory signature saved in the target memory */
+    if (!chibios_signature) {
+        if (!chibios_update_memory_signature()) {
+            WriteStringToGdbConsole("Reading the memory signature of ChibiOS/RT failed\n");
+            return FALSE;
+        }
+    }
+
+    /* ChibiOS does not save the current thread count. We have to first
+     * parse the double linked thread list to check for errors and the number of
+     * threads. */
+    const uint32_t rlist = chibios_symbol_list[CHIBIOS_VAL_CH].value + CH_RLIST_OFFSET;
+    const struct chibios_chdebug *signature = chibios_signature;
+    uint32_t current;
+    uint32_t previous;
+    uint32_t older;
+    uint32_t rtos_valid = 1;
+    
+    current = rlist;
+    previous = rlist;
+    while (1) {
+        current = Platform_MemRead32((void*)(uint64_t)(current + signature->cf_off_newer));
+
+        /* Could be NULL if the kernel is not initialized yet or if the
+         * registry is corrupted. */
+        if (current == 0) {
+            WriteStringToGdbConsole("ChibiOS registry integrity check failed, NULL pointer\n");
+
+            rtos_valid = 0;
+            break;
+        }
+        /* Fetch previous thread in the list as a integrity check. */
+        older = Platform_MemRead32((void*)(uint64_t)(current + signature->cf_off_older));
+        if ((older == 0) || (older != previous)) {
+            WriteStringToGdbConsole("ChibiOS registry integrity check failed, "
+                        "double linked list violation\n");
+            rtos_valid = 0;
+            break;
+        }
+        /* Check for full iteration of the linked list. */
+        if (current == rlist)
+            break;
+        tasks_found++;
+        previous = current;
+    }
+
+	if (!rtos_valid) {
+		/* No RTOS, there is always at least the current execution, though */
+		WriteStringToGdbConsole("Only showing current execution because of a broken "
+				"ChibiOS thread registry.\n");
+
+		const char tmp_thread_name[] = "Current Execution";
+		const char tmp_thread_extra_info[] = "No RTOS thread";
+
+		thread_details[0].threadid = 1;
+		thread_details[0].exists = 1;
+
+		strcpy(thread_details[0].extra_info_str, tmp_thread_extra_info);
+
+		strcpy(thread_details[0].thread_name_str, tmp_thread_name);
+
+	    current_thread = 1;
+		thread_count = 1;
+		return TRUE;
+	}
+    thread_count = tasks_found;
+    /* Loop through linked list. */
+    size_t thd_idx;
+    for (thd_idx=0; thd_idx<thread_count && thd_idx<ARRAY_SIZE(thread_details); thd_idx++) {
+        uint32_t name_ptr = 0;
+        char tmp_str[CHIBIOS_THREAD_NAME_STR_SIZE];
+
+        current = Platform_MemRead32((void*)(uint64_t)(current + signature->cf_off_newer));
+
+        /* Check for full iteration of the linked list. */
+        if (current == rlist) {
+            break;
+        }
+
+        /* Save the thread pointer */
+        thread_details[thd_idx].threadid = current;
+
+        /* read the name pointer */
+        name_ptr = Platform_MemRead32((void*)(uint64_t)(current + signature->cf_off_name));
+
+        /* Read the thread name */
+        read_address_to_mem(&tmp_str, name_ptr, CHIBIOS_THREAD_NAME_STR_SIZE);
+        tmp_str[CHIBIOS_THREAD_NAME_STR_SIZE - 1] = '\x00';
+
+        if (tmp_str[0] == '\x00')
+            strcpy(tmp_str, "No Name");
+        strcpy(thread_details[thd_idx].thread_name_str, tmp_str);
+
+        /* State info */
+        uint8_t thread_state;
+        const char *state_desc;
+
+        thread_state = Platform_MemRead8((void*)(uint64_t)(current + signature->cf_off_state));
+
+        if (thread_state < CHIBIOS_NUM_STATES)
+            state_desc = chibios_thread_states[thread_state];
+        else
+            state_desc = "Unknown";
+
+        snprintf(thread_details[thd_idx].extra_info_str,
+            sizeof(thread_details[thd_idx].extra_info_str), "Name: %s State: %s", 
+                thread_details[thd_idx].thread_name_str, state_desc);
+
+        thread_details[thd_idx].exists = 1;
+    }
+
+    uint32_t current_thrd;
+    /* NOTE: By design, cf_off_name equals readylist_current_offset */
+    current_thrd = Platform_MemRead32((void*)(uint64_t)(rlist + signature->cf_off_name));
+
+    current_thread = current_thrd;
+
+    return TRUE;
+}
+
+static uint32_t current_thread_idx = 0;
+uint32_t Platform_RtosGetFirstThreadId()
+{
+    if (chibios_update_threads()) {
+        current_thread_idx = 1;
+        return thread_details[0].threadid;
+    }
+    return 0;
+}
+
+uint32_t Platform_RtosGetNextThreadId()
+{
+    if (current_thread_idx == 0) {
+        // need to fetch first thread first
+        return 0;
+    }
+    if (current_thread_idx < thread_count) {
+        return thread_details[current_thread_idx++].threadid;
+    }
+    return 0;
+}
+
+const char* Platform_RtosGetExtraThreadInfo(uint32_t thread_id)
+{
+    int i;
+    for (i=0; i<thread_count; i++) {
+        if (thread_details[i].threadid == thread_id) {
+            return thread_details[i].extra_info_str;
+        }
+    }
+    return NULL;
+}
+
+int Platform_RtosGetThreadContext(Buffer* pBuffer, uint32_t thread_id)
+{
+    uint32_t stack_ptr = 0;
+
+    if ((thread_id == 0) || !chibios_signature)
+        return FALSE;
+
+    /* Update stacking if it can only be determined from runtime information */
+    if ((stacking_info == 0) &&
+        (!chibios_update_stacking())) {
+        WriteStringToGdbConsole("Failed to determine exact stacking\n");
+        return FALSE;
+    }
+
+    /* Read the stack pointer */
+    stack_ptr = Platform_MemRead32((void*)(uint64_t)(thread_id + chibios_signature->cf_off_ctx));
+
+    return rtos_generic_stack_read(pBuffer, stacking_info, (int64_t)stack_ptr);
 }

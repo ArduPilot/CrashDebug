@@ -12,7 +12,10 @@
 */
 #ifndef _MRI_PLATFORM_PRIV_H_
 #define _MRI_PLATFORM_PRIV_H_
+#include <buffer.h>
 
 void mriPlatform_setWaitForGdbConnect(int setting);
-
+int hasFPURegisters(void);
+void writeBytesToBufferAsHex(Buffer* pBuffer, void* pBytes, size_t byteCount);
+void* throwingZeroedMalloc(size_t size);
 #endif /* _MRI_PLATFORM_PRIV_H_ */

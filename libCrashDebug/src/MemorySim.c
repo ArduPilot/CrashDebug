@@ -15,7 +15,7 @@
 #include <string.h>
 #include <MemorySim.h>
 #include <MallocFailureInject.h>
-
+#include "mriPlatformPriv.h"
 /* Bit that can be set in Watchpoint::type field to flag as breakpoint and not watchpoint. */
 #define WATCHPOINT_BREAKPOINT (WatchpointType)((1 << 31) | WATCHPOINT_READ)
 
@@ -56,7 +56,7 @@ typedef struct MemoryRegion MemoryRegion;
 typedef struct Watchpoint Watchpoint;
 
 static void freeRegion(MemoryRegion* pRegion);
-static void* throwingZeroedMalloc(size_t size);
+void* throwingZeroedMalloc(size_t size);
 static void addRegionToTail(MemorySim* pThis, MemoryRegion* pRegion);
 static MemoryRegion* findMatchingRegion(MemorySim* pThis, uint32_t* pAddress, uint32_t size);
 static void allocateReadCountArrayForReadOnlyRegion(MemoryRegion* pRegion);
@@ -187,7 +187,7 @@ void MemorySim_CreateRegion(IMemory* pMemory, uint32_t baseAddress, uint32_t siz
     }
 }
 
-static void* throwingZeroedMalloc(size_t size)
+void* throwingZeroedMalloc(size_t size)
 {
     void* pvAlloc = malloc(size);
     if (!pvAlloc)
